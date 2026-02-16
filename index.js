@@ -110,3 +110,6 @@ http
   .listen(PORT, () => console.log("Servidor HTTP ativo"));
 
 client.login(TOKEN);
+
+const channel = await client.channels.fetch(process.env.CHANNEL_ID);
+await channel.send("✅ FutNews ligado e pronto pra mandar notícias e placares!");
