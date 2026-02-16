@@ -1,10 +1,12 @@
 import { Client, GatewayIntentBits } from 'discord.js';
 
+const TOKEN = process.env.DISCORD_TOKEN;
+
+console.log("TOKEN EXISTE?", TOKEN ? "SIM" : "NÃO");
+
 const client = new Client({
   intents: [GatewayIntentBits.Guilds]
 });
-
-const TOKEN = process.env.DISCORD_TOKEN;
 
 client.once('ready', () => {
   console.log(`Bot online como ${client.user.tag}`);
