@@ -1,13 +1,13 @@
-{
-  "name": "FutNews",
-  "version": "1.0.0",
-  "description": "Bot de futebol brasileiro",
-  "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
-  "dependencies": {
-    "axios": "^1.6.0",
-    "discord.js": "^14.13.0"
-  }
-}
+import { Client, GatewayIntentBits } from 'discord.js';
+
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds]
+});
+
+const TOKEN = process.env.DISCORD_TOKEN;
+
+client.once('ready', () => {
+  console.log(`Bot online como ${client.user.tag}`);
+});
+
+client.login(TOKEN);
