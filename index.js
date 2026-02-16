@@ -21,3 +21,5 @@ http.createServer((req, res) => {
 }).listen(PORT, () => {
   console.log("Servidor HTTP ativo");
 });
+const TOKEN = process.env.DISCORD_TOKEN;
+console.log("TOKEN len:", TOKEN ? TOKEN.length : 0);
