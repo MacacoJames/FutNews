@@ -1,47 +1,16 @@
-const { Client, GatewayIntentBits } = require('discord.js');
-const axios = require('axios');
-
-const TOKEN = process.env.DISCORD_TOKEN;
-const API_KEY = process.env.FOOTBALL_API_KEY;
-const CHANNEL_ID = process.env.CHANNEL_ID;
-
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds]
-});
-
-let lastScores = {};
-
-client.once('ready', () => {
-  console.log(`Bot online como ${client.user.tag}`);
-  setInterval(checkMatches, 60000);
-});
-
-async function checkMatches() {
-  try {
-    const response = await axios.get(
-      'https://api.football-data.org/v4/competitions/BSA/matches?status=LIVE',
-      {
-        headers: { 'X-Auth-Token': API_KEY }
-      }
-    );
-
-    const channel = await client.channels.fetch(CHANNEL_ID);
-
-    response.data.matches.forEach(match => {
-      const id = match.id;
-      const home = match.homeTeam.name;
-      const away = match.awayTeam.name;
-      const score = `${match.score.fullTime.home ?? 0} - ${match.score.fullTime.away ?? 0}`;
-
-      if (lastScores[id] !== score) {
-        lastScores[id] = score;
-        channel.send(`⚽ GOL / Atualização!\n${home} ${score} ${away}`);
-      }
-    });
-
-  } catch (error) {
-    console.error(error);
+{
+  "name": "FutNews",
+  "version": "1.0.0",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.11.0",
+    "node-fetch": "^3.3.1"
   }
 }
+
 
 client.login(TOKEN);
