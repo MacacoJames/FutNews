@@ -1,15 +1,15 @@
 {
   "name": "FutNews",
   "version": "1.0.0",
-  "main": "index.js",
   "type": "module",
+  "main": "index.js",
   "scripts": {
     "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.13.0",
+    "node-fetch": "^3.3.2",
+    "rss-parser": "^3.13.0"
+  }
 }
-"dependencies": {
-  "discord.js": "^14.11.0",
-  "node-fetch": "^3.3.1",
-  "rss-parser": "^3.13.0"
-}
-
 
