@@ -13,6 +13,10 @@ const client = new Client({
 const TOKEN = process.env.DISCORD_TOKEN;
 const FOOTBALL_API_KEY = process.env.FOOTBALL_API_KEY;
 
+// ===== Anti-duplicação / anti-spam (GLOBAL) =====
+const seenMsgIds = new Set();
+const cmdCooldown = new Map(); // key -> timestamp
+
 function isoDateUTC(d = new Date()) {
   return d.toISOString().slice(0, 10); // YYYY-MM-DD (UTC)
 }
@@ -30,7 +34,9 @@ async function footballGet(url) {
 }
 
 async function getStandingsTable() {
-  const data = await footballGet("https://api.football-data.org/v4/competitions/BSA/standings");
+  const data = await footballGet(
+    "https://api.football-data.org/v4/competitions/BSA/standings"
+  );
   const total = data.standings?.find((s) => s.type === "TOTAL");
   const table = total?.table;
   if (!table?.length) throw new Error("Não consegui pegar a tabela agora.");
@@ -40,24 +46,31 @@ async function getStandingsTable() {
 client.once("ready", () => {
   console.log(`Bot online como ${client.user.tag} | PID ${process.pid}`);
 });
-const cooldown = new Set();
 
 client.on("messageCreate", async (msg) => {
-  if (msg.author.bot) return;
+  try {
+    if (msg.author.bot) return;
 
-  // 👇 Anti duplicação
-  if (cooldown.has(msg.id)) return;
-  cooldown.add(msg.id);
-  setTimeout(() => cooldown.delete(msg.id), 3000);
+    // ===== Anti duplicação por ID da mensagem =====
+    if (seenMsgIds.has(msg.id)) return;
+    seenMsgIds.add(msg.id);
+    setTimeout(() => seenMsgIds.delete(msg.id), 60_000);
 
-  if (msg.author.bot) return;
+    const text = msg.content.trim();
+    const lower = text.toLowerCase();
 
-  const text = msg.content.trim();
-  const lower = text.toLowerCase();
+    // ===== Anti spam por comando (mesma pessoa no mesmo canal) =====
+    // Evita repetir se o Discord disparar o evento mais de uma vez,
+    // ou se a pessoa apertar enter várias vezes.
+    const key = `${msg.channelId}:${msg.author.id}:${lower}`;
+    const now = Date.now();
+    const last = cmdCooldown.get(key) || 0;
+    if (now - last < 5000) return; // 5 segundos
+    cmdCooldown.set(key, now);
+    setTimeout(() => cmdCooldown.delete(key), 60_000);
 
-  // ============ !tabela [1..20] ============
-  if (lower.startsWith("!tabela")) {
-    try {
+    // ============ !tabela [1..20] ============
+    if (lower.startsWith("!tabela")) {
       const parts = lower.split(/\s+/);
       let limit = 20;
       if (parts[1]) {
@@ -87,16 +100,11 @@ client.on("messageCreate", async (msg) => {
           "```" +
           `Comandos: **!tabela 10**, **!jogos hoje**, **!time flamengo**`
       );
-    } catch (err) {
-      console.log(err);
-      await msg.channel.send(`⚠️ ${err.message || "Erro ao buscar a tabela."}`);
+      return;
     }
-    return;
-  }
 
-  // ============ !jogos hoje ============
-  if (lower === "!jogos hoje" || lower === "!jogos hj") {
-    try {
+    // ============ !jogos hoje ============
+    if (lower === "!jogos hoje" || lower === "!jogos hj") {
       const today = isoDateUTC(new Date());
       const url = `https://api.football-data.org/v4/competitions/BSA/matches?dateFrom=${today}&dateTo=${today}`;
       const data = await footballGet(url);
@@ -112,33 +120,32 @@ client.on("messageCreate", async (msg) => {
         const away = m.awayTeam?.name ?? "Fora";
         const utc = m.utcDate ? new Date(m.utcDate) : null;
         const hora = utc
-          ? utc.toLocaleTimeString("pt-BR", { timeZone: "America/Sao_Paulo", hour: "2-digit", minute: "2-digit" })
+          ? utc.toLocaleTimeString("pt-BR", {
+              timeZone: "America/Sao_Paulo",
+              hour: "2-digit",
+              minute: "2-digit",
+            })
           : "--:--";
 
         const status = m.status || "";
         const hs = m.score?.fullTime?.home;
         const as = m.score?.fullTime?.away;
-        const score = (hs != null && as != null) ? ` — ${hs} x ${as}` : "";
+        const score = hs != null && as != null ? ` — ${hs} x ${as}` : "";
         return `• ${hora} — ${home} vs ${away}${score} (${status})`;
       });
 
       await msg.channel.send(`📅 **Brasileirão — Jogos de hoje**\n` + lines.join("\n"));
-    } catch (err) {
-      console.log(err);
-      await msg.channel.send(`⚠️ ${err.message || "Erro ao buscar jogos de hoje."}`);
-    }
-    return;
-  }
-
-  // ============ !time <nome> ============
-  if (lower.startsWith("!time ")) {
-    const query = text.slice("!time ".length).trim();
-    if (!query) {
-      await msg.channel.send("⚠️ Use assim: **!time flamengo**");
       return;
     }
 
-    try {
+    // ============ !time <nome> ============
+    if (lower.startsWith("!time ")) {
+      const query = text.slice("!time ".length).trim();
+      if (!query) {
+        await msg.channel.send("⚠️ Use assim: **!time flamengo**");
+        return;
+      }
+
       const table = await getStandingsTable();
 
       const q = query.toLowerCase();
@@ -150,7 +157,9 @@ client.on("messageCreate", async (msg) => {
       });
 
       if (!found) {
-        await msg.channel.send(`⚠️ Não achei esse time na tabela. Tenta outro nome (ex: **!time botafogo**).`);
+        await msg.channel.send(
+          `⚠️ Não achei esse time na tabela. Tenta outro nome (ex: **!time botafogo**).`
+        );
         return;
       }
 
@@ -162,6 +171,7 @@ client.on("messageCreate", async (msg) => {
       const to = isoDateUTC(addDays(new Date(), 30));
       const schedUrl = `https://api.football-data.org/v4/competitions/BSA/matches?status=SCHEDULED&dateFrom=${from}&dateTo=${to}`;
       const sched = await footballGet(schedUrl);
+
       const upcoming = (sched?.matches ?? [])
         .filter((m) => m.homeTeam?.id === teamId || m.awayTeam?.id === teamId)
         .slice(0, 3)
@@ -170,7 +180,13 @@ client.on("messageCreate", async (msg) => {
           const away = m.awayTeam?.name ?? "Fora";
           const utc = m.utcDate ? new Date(m.utcDate) : null;
           const dataHora = utc
-            ? utc.toLocaleString("pt-BR", { timeZone: "America/Sao_Paulo", day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })
+            ? utc.toLocaleString("pt-BR", {
+                timeZone: "America/Sao_Paulo",
+                day: "2-digit",
+                month: "2-digit",
+                hour: "2-digit",
+                minute: "2-digit",
+              })
             : "data a definir";
           return `• ${dataHora} — ${home} vs ${away}`;
         });
@@ -186,16 +202,19 @@ client.on("messageCreate", async (msg) => {
           : `\n\n📅 **Próximos jogos:** não encontrei nos próximos 30 dias.`;
 
       await msg.channel.send(resumo + prox);
-    } catch (err) {
-      console.log(err);
-      await msg.channel.send(`⚠️ ${err.message || "Erro ao buscar info do time."}`);
+      return;
     }
-    return;
-  }
 
-  // ============ !teste ============
-  if (lower === "!teste") {
-    await msg.channel.send("✅ FutNews respondeu! Tá funcionando certinho.");
+    // ============ !teste ============
+    if (lower === "!teste") {
+      await msg.channel.send("✅ FutNews respondeu! Tá funcionando certinho.");
+      return;
+    }
+  } catch (err) {
+    console.log(err);
+    try {
+      await msg.channel.send(`⚠️ ${err.message || "Erro inesperado."}`);
+    } catch {}
   }
 });
 
@@ -209,3 +228,4 @@ http
   .listen(PORT, () => console.log("Servidor HTTP ativo"));
 
 client.login(TOKEN);
+
