@@ -40,9 +40,16 @@ async function getStandingsTable() {
 client.once("ready", () => {
   console.log(`Bot online como ${client.user.tag} | PID ${process.pid}`);
 });
-
+const cooldown = new Set();
 
 client.on("messageCreate", async (msg) => {
+  if (msg.author.bot) return;
+
+  // 👇 Anti duplicação
+  if (cooldown.has(msg.id)) return;
+  cooldown.add(msg.id);
+  setTimeout(() => cooldown.delete(msg.id), 3000);
+
   if (msg.author.bot) return;
 
   const text = msg.content.trim();
