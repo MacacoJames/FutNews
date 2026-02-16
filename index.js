@@ -38,8 +38,9 @@ async function getStandingsTable() {
 }
 
 client.once("ready", () => {
-  console.log(`Bot online como ${client.user.tag}`);
+  console.log(`Bot online como ${client.user.tag} | PID ${process.pid}`);
 });
+
 
 client.on("messageCreate", async (msg) => {
   if (msg.author.bot) return;
