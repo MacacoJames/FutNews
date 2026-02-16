@@ -11,67 +11,99 @@ const FOOTBALL_API_KEY = process.env.FOOTBALL_API_KEY;
 const RSS_FEED_URL = process.env.RSS_FEED_URL;
 
 const parser = new Parser();
-let lastNews = null;
+
+let lastRssGuid = null;
+const lastScores = new Map();
 
 client.once("ready", async () => {
   console.log(`Bot online como ${client.user.tag}`);
-  setInterval(checkNews, 60000);
-  setInterval(checkGames, 60000);
+
+  // loops
+  setInterval(() => checkRssNews().catch(console.log), 60_000);
+  setInterval(() => checkLiveMatches().catch(console.log), 60_000);
 });
 
-// 📰 NOTÍCIAS
-async function checkNews() {
-  try {
-    if (!RSS_FEED_URL) return;
-
-    const channel = await client.channels.fetch(CHANNEL_ID);
-    const feed = await parser.parseURL(RSS_FEED_URL);
-
-    if (!feed.items.length) return;
-
-    const latest = feed.items[0];
-
-    if (latest.link === lastNews) return;
-
-    lastNews = latest.link;
-
-    await channel.send(`📰 **${latest.title}**\n${latest.link}`);
-  } catch (err) {
-    console.log("Erro notícias:", err.message);
-  }
+async function getChannel() {
+  if (!CHANNEL_ID) throw new Error("CHANNEL_ID faltando");
+  return await client.channels.fetch(CHANNEL_ID);
 }
 
-// ⚽ JOGOS AO VIVO
-async function checkGames() {
-  try {
-    if (!FOOTBALL_API_KEY) return;
+// 📰 RSS
+async function checkRssNews() {
+  if (!RSS_FEED_URL) return;
 
-    const res = await fetch(
-      "https://api.football-data.org/v4/competitions/BSA/matches?status=LIVE",
-      { headers: { "X-Auth-Token": FOOTBALL_API_KEY } }
-    );
+  const feed = await parser.parseURL(RSS_FEED_URL);
+  if (!feed?.items?.length) return;
 
-    const data = await res.json();
-    if (!data.matches) return;
+  const latest = feed.items[0];
+  const guid = latest.guid || latest.id || latest.link;
+  if (!guid) return;
 
-    const channel = await client.channels.fetch(CHANNEL_ID);
+  // evita spam no 1º start
+  if (lastRssGuid === null) {
+    lastRssGuid = guid;
+    console.log("RSS pronto (sem postar a primeira notícia).");
+    return;
+  }
 
-    data.matches.forEach(async (m) => {
-      const home = m.homeTeam.name;
-      const away = m.awayTeam.name;
-      const score = `${m.score.fullTime.home ?? 0} x ${m.score.fullTime.away ?? 0}`;
+  if (guid === lastRssGuid) return;
+  lastRssGuid = guid;
 
+  const channel = await getChannel();
+  await channel.send(`📰 **${latest.title ?? "Notícia"}**\n${latest.link ?? ""}`);
+}
+
+// ⚽ LIVE placar
+async function checkLiveMatches() {
+  if (!FOOTBALL_API_KEY) return;
+
+  const res = await fetch(
+    "https://api.football-data.org/v4/competitions/BSA/matches?status=LIVE",
+    { headers: { "X-Auth-Token": FOOTBALL_API_KEY } }
+  );
+
+  if (!res.ok) {
+    console.log("API futebol erro:", res.status);
+    return;
+  }
+
+  const data = await res.json();
+  const matches = data?.matches ?? [];
+  if (!matches.length) return;
+
+  const channel = await getChannel();
+
+  for (const m of matches) {
+    const id = m.id;
+    const home = m.homeTeam?.name ?? "Casa";
+    const away = m.awayTeam?.name ?? "Fora";
+
+    const hs = m.score?.fullTime?.home ?? m.score?.halfTime?.home ?? 0;
+    const as = m.score?.fullTime?.away ?? m.score?.halfTime?.away ?? 0;
+    const score = `${hs} x ${as}`;
+
+    const prev = lastScores.get(id);
+
+    if (prev === undefined) {
+      lastScores.set(id, score);
       await channel.send(`⚽ **Jogo ao vivo!**\n${home} ${score} ${away}`);
-    });
-  } catch (err) {
-    console.log("Erro jogos:", err.message);
+      continue;
+    }
+
+    if (prev !== score) {
+      lastScores.set(id, score);
+      await channel.send(`🔥 **Atualização de placar!**\n${home} ${score} ${away}`);
+    }
   }
 }
 
-// Railway HTTP
+// 🌐 HTTP pro Railway
 const PORT = process.env.PORT || 3000;
-http.createServer((req, res) => {
-  res.end("FutNews Bot Online");
-}).listen(PORT);
+http
+  .createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end("FutNews Bot Online");
+  })
+  .listen(PORT, () => console.log("Servidor HTTP ativo"));
 
 client.login(TOKEN);
