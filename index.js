@@ -25,6 +25,13 @@ const lastScores = new Map();
 client.once("ready", async () => {
   console.log(`Bot online como ${client.user.tag}`);
 
+  // 👇 BUSCA O CANAL
+  const channel = await client.channels.fetch(process.env.CHANNEL_ID);
+
+  // 👇 ENVIA MENSAGEM DE TESTE
+  await channel.send("✅ FutNews ligado e pronto pra mandar notícias e placares!");
+});
+
   // Loop
   setInterval(async () => {
     await Promise.allSettled([checkRssNews(), checkLiveMatches()]);
@@ -110,6 +117,3 @@ http
   .listen(PORT, () => console.log("Servidor HTTP ativo"));
 
 client.login(TOKEN);
-
-const channel = await client.channels.fetch(process.env.CHANNEL_ID);
-await channel.send("✅ FutNews ligado e pronto pra mandar notícias e placares!");
