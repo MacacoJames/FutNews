@@ -1,19 +1,30 @@
 import { Client, GatewayIntentBits, EmbedBuilder } from "discord.js";
 import http from "http";
 import fetch from "node-fetch";
+import Parser from "rss-parser";
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const FOOTBALL_API_KEY = process.env.FOOTBALL_API_KEY;
 const CHANNEL_ID = process.env.CHANNEL_ID;
 
+// RSS (notícias)
+const RSS_FEED_URL =
+  process.env.RSS_FEED_URL || "https://ge.globo.com/rss/futebol/brasileirao-serie-a/";
+
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+  ],
 });
 
 const INSTANCE_ID =
   process.env.INSTANCE_ID || `inst-${Math.random().toString(36).slice(2, 8)}`;
 
 // ===== util =====
+const parser = new Parser();
+
 function isoDateUTC(d = new Date()) {
   return d.toISOString().slice(0, 10);
 }
@@ -31,7 +42,7 @@ function safeTeamName(team) {
   return team?.shortName || team?.name || "Time";
 }
 function crestUrl(team) {
-  return team?.crest || null; // escudo (football-data)
+  return team?.crest || null; // escudo real vindo da API
 }
 async function footballGet(url) {
   const res = await fetch(url, { headers: { "X-Auth-Token": FOOTBALL_API_KEY } });
@@ -46,11 +57,13 @@ async function getChannel() {
 const seenMsgIds = new Set();
 const cmdCooldown = new Map();
 
-// ===== estado de alertas =====
-// matchId -> { home: number, away: number, status: string }
-const matchState = new Map();
+// ===== estado (alertas de jogo) =====
+const matchState = new Map(); // matchId -> { home, away, status }
 const pregameSent = new Set();   // matchId
 const finishedSent = new Set();  // matchId
+
+// ===== estado (notícias RSS) =====
+let lastNewsId = null; // evita repetir (memória do processo)
 
 // ===== comandos =====
 async function fetchStandings() {
@@ -189,8 +202,10 @@ function helpEmbed() {
         "• `!aovivo`",
         "• `!time flamengo`",
         "• `!teste`",
+        "• `!ajuda`",
         "",
-        "✅ Automático: **pré-jogo (10 min)**, **GOOOL**, **fim de jogo** (Brasileirão).",
+        "📰 Notícias automáticas com imagem (RSS).",
+        "✅ Automático: **pré-jogo (10 min)**, **GOOOL**, **fim de jogo**.",
       ].join("\n")
     )
     .setFooter({ text: `FutNews • ${INSTANCE_ID}` });
@@ -198,14 +213,79 @@ function helpEmbed() {
   return { embeds: [emb] };
 }
 
-// ===== ALERTAS AUTOMÁTICOS =====
+// ====== NOTÍCIAS (RSS) com imagem ======
+function pickImageFromRssItem(item) {
+  // tenta as formas mais comuns de imagem no RSS
+  const enclosureUrl = item?.enclosure?.url;
+  if (enclosureUrl) return enclosureUrl;
+
+  const mediaContent = item?.["media:content"]?.url || item?.["media:content"]?.[0]?.url;
+  if (mediaContent) return mediaContent;
+
+  const mediaThumb = item?.["media:thumbnail"]?.url || item?.["media:thumbnail"]?.[0]?.url;
+  if (mediaThumb) return mediaThumb;
+
+  // tenta pegar <img src="..."> do conteúdo/descrição (fallback)
+  const html = item?.content || item?.["content:encoded"] || item?.summary || item?.contentSnippet || "";
+  const match = String(html).match(/<img[^>]+src=["']([^"']+)["']/i);
+  if (match?.[1]) return match[1];
+
+  return null;
+}
+
+async function pollNews() {
+  try {
+    if (!RSS_FEED_URL || !CHANNEL_ID) return;
+
+    const feed = await parser.parseURL(RSS_FEED_URL);
+    const items = feed?.items ?? [];
+    if (!items.length) return;
+
+    const latest = items[0];
+    const newsId = latest.guid || latest.id || latest.link;
+    if (!newsId) return;
+
+    // primeira execução: só registra sem spammar
+    if (lastNewsId === null) {
+      lastNewsId = newsId;
+      console.log("RSS pronto (sem postar a primeira notícia).");
+      return;
+    }
+
+    if (newsId === lastNewsId) return;
+    lastNewsId = newsId;
+
+    const channel = await getChannel();
+
+    const title = latest.title || "Nova notícia";
+    const link = latest.link || "";
+    const img = pickImageFromRssItem(latest);
+
+    const emb = new EmbedBuilder()
+      .setTitle(`📰 ${title}`)
+      .setURL(link)
+      .setFooter({ text: `Notícias • ${INSTANCE_ID}` });
+
+    // descrição curtinha (evita texto enorme)
+    const descBase =
+      (latest.contentSnippet || latest.summary || "").toString().trim().slice(0, 180);
+    if (descBase) emb.setDescription(descBase + (descBase.length >= 180 ? "..." : ""));
+
+    if (img) emb.setImage(img);
+
+    await channel.send({ embeds: [emb] });
+  } catch (e) {
+    console.log("pollNews erro:", e?.message || e);
+  }
+}
+
+// ====== ALERTAS AUTOMÁTICOS (pré-jogo / gol / fim) ======
 async function pollAlerts() {
   try {
     if (!FOOTBALL_API_KEY || !CHANNEL_ID) return;
 
     const channel = await getChannel();
 
-    // Pega jogos de hoje até amanhã (pra pré-jogo pegar de madrugada/virada)
     const from = isoDateUTC(new Date());
     const to = isoDateUTC(new Date(Date.now() + 2 * 86400_000));
     const url = `https://api.football-data.org/v4/competitions/BSA/matches?dateFrom=${from}&dateTo=${to}`;
@@ -217,9 +297,10 @@ async function pollAlerts() {
 
     for (const m of matches) {
       const id = m.id;
-      const status = m.status; // SCHEDULED/TIMED/LIVE/FINISHED...
+      const status = m.status;
       const homeTeam = m.homeTeam;
       const awayTeam = m.awayTeam;
+
       const homeName = safeTeamName(homeTeam);
       const awayName = safeTeamName(awayTeam);
 
@@ -236,29 +317,28 @@ async function pollAlerts() {
 
       const prev = matchState.get(id) || { home: hs, away: as, status };
 
-      // --- PRÉ-JOGO 10 MIN ANTES ---
-      if (!pregameSent.has(id) && (status === "SCHEDULED" || status === "TIMED")) {
-        if (m.utcDate) {
-          const kick = Date.parse(m.utcDate);
-          const diff = kick - now; // ms até começar
+      // PRÉ-JOGO 10 MIN
+      if (!pregameSent.has(id) && (status === "SCHEDULED" || status === "TIMED") && m.utcDate) {
+        const kick = Date.parse(m.utcDate);
+        const diff = kick - now;
+        if (diff > 0 && diff <= 10 * 60_000) {
+          pregameSent.add(id);
 
-          if (diff > 0 && diff <= 10 * 60_000) {
-            pregameSent.add(id);
+          const emb = new EmbedBuilder()
+            .setTitle("⏰ PRÉ-JOGO! (começa em ~10 min)")
+            .setDescription(
+              `⚽ **${homeName}** vs **${awayName}**\n🗓️ ${brDateTime(m.utcDate)} _(Brasília)_`
+            )
+            .setFooter({ text: `FutNews • ${INSTANCE_ID}` });
 
-            const emb = new EmbedBuilder()
-              .setTitle("⏰ PRÉ-JOGO! (começa em ~10 min)")
-              .setDescription(`⚽ **${homeName}** vs **${awayName}**\n🗓️ ${brDateTime(m.utcDate)} _(Brasília)_`)
-              .setFooter({ text: `FutNews • ${INSTANCE_ID}` });
+          const crest = crestUrl(homeTeam) || crestUrl(awayTeam);
+          if (crest) emb.setThumbnail(crest);
 
-            const crest = crestUrl(homeTeam) || crestUrl(awayTeam);
-            if (crest) emb.setThumbnail(crest);
-
-            await channel.send({ embeds: [emb] });
-          }
+          await channel.send({ embeds: [emb] });
         }
       }
 
-      // --- COMEÇOU (LIVE) ---
+      // COMEÇOU (LIVE)
       if (prev.status !== "LIVE" && status === "LIVE") {
         const emb = new EmbedBuilder()
           .setTitle("🟢 BOLA ROLANDO!")
@@ -272,7 +352,7 @@ async function pollAlerts() {
         await channel.send({ embeds: [emb] });
       }
 
-      // --- GOL (mudança de placar) ---
+      // GOL (mudou placar)
       if (status === "LIVE" && (hs !== prev.home || as !== prev.away)) {
         const homeScored = hs > prev.home;
         const awayScored = as > prev.away;
@@ -300,7 +380,7 @@ async function pollAlerts() {
         await channel.send({ embeds: [emb] });
       }
 
-      // --- FIM DE JOGO (FINISHED) ---
+      // FIM DE JOGO
       if (status === "FINISHED" && !finishedSent.has(id)) {
         finishedSent.add(id);
 
@@ -315,7 +395,6 @@ async function pollAlerts() {
         await channel.send({ embeds: [emb] });
       }
 
-      // atualiza estado
       matchState.set(id, { home: hs, away: as, status });
     }
   } catch (e) {
@@ -328,12 +407,10 @@ async function handlePrefix(msg) {
   const text = msg.content.trim();
   const lower = text.toLowerCase();
 
-  // anti duplicação por msg.id
   if (seenMsgIds.has(msg.id)) return;
   seenMsgIds.add(msg.id);
   setTimeout(() => seenMsgIds.delete(msg.id), 60_000);
 
-  // cooldown por comando
   const key = `${msg.channelId}:${msg.author.id}:${lower}`;
   const now = Date.now();
   const last = cmdCooldown.get(key) || 0;
@@ -376,7 +453,12 @@ client.on("messageCreate", async (msg) => {
 
 client.once("ready", () => {
   console.log(`ONLINE: ${client.user.tag} | PID ${process.pid} | ${INSTANCE_ID}`);
-  setInterval(pollAlerts, 30_000); // 30s
+
+  // Alertas de jogos (pré/goal/fim)
+  setInterval(pollAlerts, 30_000);
+
+  // Notícias RSS (com imagem)
+  setInterval(pollNews, 120_000);
 });
 
 // HTTP (Railway)
