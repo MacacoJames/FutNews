@@ -7,9 +7,11 @@ const TOKEN = process.env.DISCORD_TOKEN;
 const FOOTBALL_API_KEY = process.env.FOOTBALL_API_KEY;
 const CHANNEL_ID = process.env.CHANNEL_ID;
 
-// RSS (notícias) — pode trocar no Railway (Variables)
+// RSS (notícias) — troque no Railway (Variables) se quiser
+// Sugestão confiável (Google News):
+// https://news.google.com/rss/search?q=Brasileir%C3%A3o%20S%C3%A9rie%20A&hl=pt-BR&gl=BR&ceid=BR:pt-419
 const RSS_FEED_URL =
-  process.env.RSS_FEED_URL || "https://ge.globo.com/rss/futebol/brasileirao-serie-a/";
+  process.env.RSS_FEED_URL || "https://news.google.com/rss/search?q=Brasileir%C3%A3o%20S%C3%A9rie%20A&hl=pt-BR&gl=BR&ceid=BR:pt-419";
 
 const client = new Client({
   intents: [
@@ -22,7 +24,7 @@ const client = new Client({
 const INSTANCE_ID =
   process.env.INSTANCE_ID || `inst-${Math.random().toString(36).slice(2, 8)}`;
 
-// ===== RSS parser tolerante (aceita atributos sem valor) =====
+// ===== XML parser tolerante (RSS doido) =====
 const xmlParser = new XMLParser({
   ignoreAttributes: false,
   attributeNamePrefix: "",
@@ -60,7 +62,7 @@ async function getChannel() {
   return await client.channels.fetch(CHANNEL_ID);
 }
 
-// ===== anti-duplicação (prefix) =====
+// ===== anti-duplicação de comandos (evita spam) =====
 const seenMsgIds = new Set();
 const cmdCooldown = new Map();
 
@@ -69,12 +71,38 @@ const matchState = new Map();
 const pregameSent = new Set();
 const finishedSent = new Set();
 
-// ===== estado (notícias RSS) =====
-let lastNewsId = null;
+// ===== estado (notícias) =====
+// anti-repetição forte mesmo se guid mudar
+const seenNewsKeys = new Set();
+let rssWarmedUp = false;
+
+function rememberKey(key) {
+  seenNewsKeys.add(key);
+  if (seenNewsKeys.size > 60) {
+    const first = seenNewsKeys.values().next().value;
+    seenNewsKeys.delete(first);
+  }
+}
+function newsKey(it) {
+  const title = (it?.title || "").toString().trim();
+  const link = (it?.link || "").toString().trim();
+  const date = (it?.pubDate || it?.published || it?.["dc:date"] || "").toString().trim();
+  return `${title}||${link}||${date}`;
+}
 
 // ===== RSS helpers =====
+function decodeEntities(str = "") {
+  return String(str)
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#x27;/g, "'")
+    .replace(/&#x2F;/g, "/");
+}
 function stripHtml(html = "") {
-  return String(html)
+  return decodeEntities(String(html))
     .replace(/<!\[CDATA\[/g, "")
     .replace(/\]\]>/g, "")
     .replace(/<[^>]*>/g, " ")
@@ -87,24 +115,45 @@ function pickImageFromRssItem(item) {
   if (item?.enclosure?.url) return item.enclosure.url;
   if (item?.enclosure?.["@_url"]) return item.enclosure["@_url"];
 
-  // media:content / media:thumbnail (pode vir como objeto ou array)
+  // media:content / media:thumbnail
   const mc = item?.["media:content"];
-  if (Array.isArray(mc) && (mc[0]?.url || mc[0]?.["@_url"])) return mc[0].url || mc[0]["@_url"];
-  if (mc?.url || mc?.["@_url"]) return mc.url || mc["@_url"];
+  if (Array.isArray(mc)) {
+    const first = mc.find((x) => x?.url || x?.["@_url"]);
+    if (first) return first.url || first["@_url"];
+  } else if (mc?.url || mc?.["@_url"]) {
+    return mc.url || mc["@_url"];
+  }
 
   const mt = item?.["media:thumbnail"];
-  if (Array.isArray(mt) && (mt[0]?.url || mt[0]?.["@_url"])) return mt[0].url || mt[0]["@_url"];
-  if (mt?.url || mt?.["@_url"]) return mt.url || mt["@_url"];
+  if (Array.isArray(mt)) {
+    const first = mt.find((x) => x?.url || x?.["@_url"]);
+    if (first) return first.url || first["@_url"];
+  } else if (mt?.url || mt?.["@_url"]) {
+    return mt.url || mt["@_url"];
+  }
 
-  // tenta pegar <img src="..."> da descrição/conteúdo
-  const html = item?.description || item?.["content:encoded"] || item?.content || "";
-  const match = String(html).match(/<img[^>]+src=["']([^"']+)["']/i);
-  if (match?.[1]) return match[1];
+  // description/content (muitas vezes vem escapado tipo &lt;img...&gt;)
+  const htmlRaw =
+    item?.description ||
+    item?.summary ||
+    item?.["content:encoded"] ||
+    item?.content ||
+    "";
+  const html = decodeEntities(String(htmlRaw));
+
+  const m1 = html.match(/<img[^>]+src=["']([^"']+)["']/i);
+  if (m1?.[1]) return m1[1];
+
+  // srcset
+  const m2 = html.match(/srcset=["']([^"']+)["']/i);
+  if (m2?.[1]) {
+    const firstUrl = m2[1].split(",")[0]?.trim()?.split(" ")[0];
+    if (firstUrl) return firstUrl;
+  }
 
   return null;
 }
 
-// Baixa o RSS como texto e faz parse com fast-xml-parser
 async function getRssItems(url) {
   const res = await fetch(url, {
     headers: {
@@ -117,15 +166,23 @@ async function getRssItems(url) {
   const xml = await res.text();
   const parsed = xmlParser.parse(xml);
 
-  // RSS 2.0 típico: rss.channel.item
   const channel = parsed?.rss?.channel || parsed?.channel;
   let items = channel?.item || [];
-
   if (!Array.isArray(items)) items = items ? [items] : [];
+
+  // Normaliza campos comuns
+  items = items.map((it) => ({
+    ...it,
+    title: it.title?.["#text"] ?? it.title,
+    link: it.link?.href ?? it.link?.["#text"] ?? it.link,
+    pubDate: it.pubDate?.["#text"] ?? it.pubDate,
+    description: it.description?.["#text"] ?? it.description,
+  }));
+
   return items;
 }
 
-// ===== comandos tabela/rodada/aovivo/time =====
+// ===== comandos =====
 async function fetchStandings() {
   const data = await footballGet("https://api.football-data.org/v4/competitions/BSA/standings");
   const total = data.standings?.find((s) => s.type === "TOTAL");
@@ -261,7 +318,7 @@ function helpEmbed() {
         "• `!rodada`",
         "• `!aovivo`",
         "• `!time flamengo`",
-        "• `!noticias` (últimas 5 com imagem)",
+        "• `!noticias` / `!noticia` (últimas 5 com imagem)",
         "• `!teste`",
         "• `!ajuda`",
         "",
@@ -281,13 +338,13 @@ async function cmdNoticias(limit = 5) {
   if (!slice.length) return { content: "📰 Não achei notícias agora." };
 
   const first = slice[0];
-  const title = first.title || "Notícia";
-  const link = first.link || "";
+  const title = stripHtml(first.title || "Notícia");
+  const link = (first.link || "").toString().trim();
   const img = pickImageFromRssItem(first);
 
   const emb = new EmbedBuilder()
-    .setTitle(`📰 ${stripHtml(title)}`)
-    .setURL(link)
+    .setTitle(`📰 ${title}`)
+    .setURL(link || null)
     .setFooter({ text: `Notícias • ${INSTANCE_ID}` });
 
   const descRaw = first.description || first.summary || first["content:encoded"] || "";
@@ -298,7 +355,7 @@ async function cmdNoticias(limit = 5) {
 
   const rest = slice.slice(1).map((it, i) => {
     const t = stripHtml(it.title || `Notícia ${i + 2}`);
-    const l = it.link || "";
+    const l = (it.link || "").toString().trim();
     return `${i + 2}. ${t}${l ? ` — ${l}` : ""}`;
   });
 
@@ -308,7 +365,7 @@ async function cmdNoticias(limit = 5) {
   };
 }
 
-// ===== notícias automáticas =====
+// ===== notícias automáticas (SEM repetir) =====
 async function pollNews() {
   try {
     if (!RSS_FEED_URL || !CHANNEL_ID) return;
@@ -316,31 +373,38 @@ async function pollNews() {
     const items = await getRssItems(RSS_FEED_URL);
     if (!items.length) return;
 
-    const latest = items[0];
-    const newsId = latest.guid || latest.id || latest.link || latest.title;
-    if (!newsId) return;
-
-    if (lastNewsId === null) {
-      lastNewsId = newsId;
-      console.log("RSS pronto (sem postar a primeira notícia).");
+    // Primeira execução: aquece cache e NÃO posta nada
+    if (!rssWarmedUp) {
+      for (const it of items.slice(0, 10)) rememberKey(newsKey(it));
+      rssWarmedUp = true;
+      console.log("RSS aquecido (sem postar na primeira rodada).");
       return;
     }
 
-    if (newsId === lastNewsId) return;
-    lastNewsId = newsId;
+    // pega a primeira notícia "nova" que ainda não enviamos
+    let picked = null;
+    for (const it of items.slice(0, 10)) {
+      const key = newsKey(it);
+      if (!seenNewsKeys.has(key)) {
+        picked = it;
+        rememberKey(key);
+        break;
+      }
+    }
+    if (!picked) return;
 
     const channel = await getChannel();
 
-    const title = stripHtml(latest.title || "Nova notícia");
-    const link = latest.link || "";
-    const img = pickImageFromRssItem(latest);
+    const title = stripHtml(picked.title || "Nova notícia");
+    const link = (picked.link || "").toString().trim();
+    const img = pickImageFromRssItem(picked);
 
     const emb = new EmbedBuilder()
       .setTitle(`📰 ${title}`)
-      .setURL(link)
+      .setURL(link || null)
       .setFooter({ text: `Notícias • ${INSTANCE_ID}` });
 
-    const descRaw = latest.description || latest.summary || latest["content:encoded"] || "";
+    const descRaw = picked.description || picked.summary || picked["content:encoded"] || "";
     const desc = stripHtml(descRaw).slice(0, 180);
     if (desc) emb.setDescription(desc + (desc.length >= 180 ? "..." : ""));
 
@@ -490,13 +554,7 @@ async function handlePrefix(msg) {
   if (lower === "!ajuda") return msg.channel.send(helpEmbed());
   if (lower === "!teste") return msg.channel.send(`✅ FutNews ativo (${INSTANCE_ID})`);
 
-if (
-  lower === "!noticias" ||
-  lower === "!noticia" ||   // sem acento ✅
-  lower === "!notícia" ||   // com acento ✅
-  lower === "!news"
-) {
-
+  if (lower === "!noticias" || lower === "!noticia" || lower === "!notícia" || lower === "!news") {
     try {
       const payload = await cmdNoticias(5);
       return msg.channel.send(payload);
@@ -538,7 +596,10 @@ client.on("messageCreate", async (msg) => {
 client.once("ready", () => {
   console.log(`ONLINE: ${client.user.tag} | PID ${process.pid} | ${INSTANCE_ID}`);
 
+  // Alertas de jogo
   setInterval(pollAlerts, 30_000);
+
+  // Notícias (não repete + tenta pegar imagem)
   setInterval(pollNews, 120_000);
 });
 
