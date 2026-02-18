@@ -201,6 +201,7 @@ function helpEmbed() {
         "• `!rodada`",
         "• `!aovivo`",
         "• `!time flamengo`",
+        "• `!noticias` (últimas 5)",
         "• `!teste`",
         "• `!ajuda`",
         "",
@@ -215,7 +216,6 @@ function helpEmbed() {
 
 // ====== NOTÍCIAS (RSS) com imagem ======
 function pickImageFromRssItem(item) {
-  // tenta as formas mais comuns de imagem no RSS
   const enclosureUrl = item?.enclosure?.url;
   if (enclosureUrl) return enclosureUrl;
 
@@ -225,12 +225,46 @@ function pickImageFromRssItem(item) {
   const mediaThumb = item?.["media:thumbnail"]?.url || item?.["media:thumbnail"]?.[0]?.url;
   if (mediaThumb) return mediaThumb;
 
-  // tenta pegar <img src="..."> do conteúdo/descrição (fallback)
-  const html = item?.content || item?.["content:encoded"] || item?.summary || item?.contentSnippet || "";
+  const html =
+    item?.content || item?.["content:encoded"] || item?.summary || item?.contentSnippet || "";
   const match = String(html).match(/<img[^>]+src=["']([^"']+)["']/i);
   if (match?.[1]) return match[1];
 
   return null;
+}
+
+async function cmdNoticias(limit = 5) {
+  const feed = await parser.parseURL(RSS_FEED_URL);
+  const items = (feed?.items ?? []).slice(0, Math.max(1, Math.min(10, limit)));
+
+  if (!items.length) return { content: "📰 Não achei notícias agora." };
+
+  const first = items[0];
+  const title = first.title || "Notícia";
+  const link = first.link || "";
+  const img = pickImageFromRssItem(first);
+
+  const emb = new EmbedBuilder()
+    .setTitle(`📰 ${title}`)
+    .setURL(link)
+    .setFooter({ text: `Notícias • ${INSTANCE_ID}` });
+
+  const descBase =
+    (first.contentSnippet || first.summary || "").toString().trim().slice(0, 180);
+  if (descBase) emb.setDescription(descBase + (descBase.length >= 180 ? "..." : ""));
+
+  if (img) emb.setImage(img);
+
+  const rest = items.slice(1).map((it, i) => {
+    const t = it.title || `Notícia ${i + 2}`;
+    const l = it.link || "";
+    return `${i + 2}. ${t}${l ? ` — ${l}` : ""}`;
+  });
+
+  return {
+    embeds: [emb],
+    content: rest.length ? `Outras:\n${rest.join("\n")}` : undefined,
+  };
 }
 
 async function pollNews() {
@@ -245,7 +279,6 @@ async function pollNews() {
     const newsId = latest.guid || latest.id || latest.link;
     if (!newsId) return;
 
-    // primeira execução: só registra sem spammar
     if (lastNewsId === null) {
       lastNewsId = newsId;
       console.log("RSS pronto (sem postar a primeira notícia).");
@@ -266,7 +299,6 @@ async function pollNews() {
       .setURL(link)
       .setFooter({ text: `Notícias • ${INSTANCE_ID}` });
 
-    // descrição curtinha (evita texto enorme)
     const descBase =
       (latest.contentSnippet || latest.summary || "").toString().trim().slice(0, 180);
     if (descBase) emb.setDescription(descBase + (descBase.length >= 180 ? "..." : ""));
@@ -420,6 +452,11 @@ async function handlePrefix(msg) {
 
   if (lower === "!ajuda") return msg.channel.send(helpEmbed());
   if (lower === "!teste") return msg.channel.send(`✅ FutNews ativo (${INSTANCE_ID})`);
+
+  if (lower === "!noticias" || lower === "!notícia" || lower === "!news") {
+    const payload = await cmdNoticias(5);
+    return msg.channel.send(payload);
+  }
 
   if (lower.startsWith("!tabela")) {
     const parts = lower.split(/\s+/);
