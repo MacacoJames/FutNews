@@ -490,7 +490,13 @@ async function handlePrefix(msg) {
   if (lower === "!ajuda") return msg.channel.send(helpEmbed());
   if (lower === "!teste") return msg.channel.send(`✅ FutNews ativo (${INSTANCE_ID})`);
 
-  if (lower === "!noticias" || lower === "!notícia" || lower === "!news") {
+if (
+  lower === "!noticias" ||
+  lower === "!noticia" ||   // sem acento ✅
+  lower === "!notícia" ||   // com acento ✅
+  lower === "!news"
+) {
+
     try {
       const payload = await cmdNoticias(5);
       return msg.channel.send(payload);
