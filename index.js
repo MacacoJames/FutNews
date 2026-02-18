@@ -7,7 +7,7 @@ const TOKEN = process.env.DISCORD_TOKEN;
 const FOOTBALL_API_KEY = process.env.FOOTBALL_API_KEY;
 const CHANNEL_ID = process.env.CHANNEL_ID;
 
-// RSS (notícias)
+// RSS (notícias) — você pode trocar no Railway (Variables)
 const RSS_FEED_URL =
   process.env.RSS_FEED_URL || "https://ge.globo.com/rss/futebol/brasileirao-serie-a/";
 
@@ -22,9 +22,17 @@ const client = new Client({
 const INSTANCE_ID =
   process.env.INSTANCE_ID || `inst-${Math.random().toString(36).slice(2, 8)}`;
 
-// ===== util =====
-const parser = new Parser();
+// ===== RSS parser (com User-Agent) =====
+const parser = new Parser({
+  requestOptions: {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (compatible; FutNewsBot/1.0)",
+      Accept: "application/rss+xml,application/xml,text/xml;q=0.9,*/*;q=0.8",
+    },
+  },
+});
 
+// ===== util =====
 function isoDateUTC(d = new Date()) {
   return d.toISOString().slice(0, 10);
 }
@@ -59,13 +67,45 @@ const cmdCooldown = new Map();
 
 // ===== estado (alertas de jogo) =====
 const matchState = new Map(); // matchId -> { home, away, status }
-const pregameSent = new Set();   // matchId
-const finishedSent = new Set();  // matchId
+const pregameSent = new Set(); // matchId
+const finishedSent = new Set(); // matchId
 
 // ===== estado (notícias RSS) =====
 let lastNewsId = null; // evita repetir (memória do processo)
 
-// ===== comandos =====
+// ===== RSS helpers =====
+function pickImageFromRssItem(item) {
+  const enclosureUrl = item?.enclosure?.url;
+  if (enclosureUrl) return enclosureUrl;
+
+  const mediaContent = item?.["media:content"]?.url || item?.["media:content"]?.[0]?.url;
+  if (mediaContent) return mediaContent;
+
+  const mediaThumb = item?.["media:thumbnail"]?.url || item?.["media:thumbnail"]?.[0]?.url;
+  if (mediaThumb) return mediaThumb;
+
+  const html =
+    item?.content || item?.["content:encoded"] || item?.summary || item?.contentSnippet || "";
+  const match = String(html).match(/<img[^>]+src=["']([^"']+)["']/i);
+  if (match?.[1]) return match[1];
+
+  return null;
+}
+
+// Baixa RSS com fetch (User-Agent) e faz parseString (evita bloqueio do parseURL)
+async function parseRss(url) {
+  const res = await fetch(url, {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (compatible; FutNewsBot/1.0)",
+      Accept: "application/rss+xml,application/xml,text/xml;q=0.9,*/*;q=0.8",
+    },
+  });
+  if (!res.ok) throw new Error(`RSS HTTP ${res.status}`);
+  const xml = await res.text();
+  return parser.parseString(xml);
+}
+
+// ===== comandos (tabela/rodada/aovivo/time) =====
 async function fetchStandings() {
   const data = await footballGet("https://api.football-data.org/v4/competitions/BSA/standings");
   const total = data.standings?.find((s) => s.type === "TOTAL");
@@ -214,27 +254,9 @@ function helpEmbed() {
   return { embeds: [emb] };
 }
 
-// ====== NOTÍCIAS (RSS) com imagem ======
-function pickImageFromRssItem(item) {
-  const enclosureUrl = item?.enclosure?.url;
-  if (enclosureUrl) return enclosureUrl;
-
-  const mediaContent = item?.["media:content"]?.url || item?.["media:content"]?.[0]?.url;
-  if (mediaContent) return mediaContent;
-
-  const mediaThumb = item?.["media:thumbnail"]?.url || item?.["media:thumbnail"]?.[0]?.url;
-  if (mediaThumb) return mediaThumb;
-
-  const html =
-    item?.content || item?.["content:encoded"] || item?.summary || item?.contentSnippet || "";
-  const match = String(html).match(/<img[^>]+src=["']([^"']+)["']/i);
-  if (match?.[1]) return match[1];
-
-  return null;
-}
-
+// ===== notícias: comando !noticias =====
 async function cmdNoticias(limit = 5) {
-  const feed = await parser.parseURL(RSS_FEED_URL);
+  const feed = await parseRss(RSS_FEED_URL);
   const items = (feed?.items ?? []).slice(0, Math.max(1, Math.min(10, limit)));
 
   if (!items.length) return { content: "📰 Não achei notícias agora." };
@@ -249,8 +271,7 @@ async function cmdNoticias(limit = 5) {
     .setURL(link)
     .setFooter({ text: `Notícias • ${INSTANCE_ID}` });
 
-  const descBase =
-    (first.contentSnippet || first.summary || "").toString().trim().slice(0, 180);
+  const descBase = (first.contentSnippet || first.summary || "").toString().trim().slice(0, 180);
   if (descBase) emb.setDescription(descBase + (descBase.length >= 180 ? "..." : ""));
 
   if (img) emb.setImage(img);
@@ -267,11 +288,12 @@ async function cmdNoticias(limit = 5) {
   };
 }
 
+// ===== notícias automáticas =====
 async function pollNews() {
   try {
     if (!RSS_FEED_URL || !CHANNEL_ID) return;
 
-    const feed = await parser.parseURL(RSS_FEED_URL);
+    const feed = await parseRss(RSS_FEED_URL);
     const items = feed?.items ?? [];
     if (!items.length) return;
 
@@ -279,6 +301,7 @@ async function pollNews() {
     const newsId = latest.guid || latest.id || latest.link;
     if (!newsId) return;
 
+    // primeira execução: não spamma notícia velha
     if (lastNewsId === null) {
       lastNewsId = newsId;
       console.log("RSS pronto (sem postar a primeira notícia).");
@@ -299,8 +322,7 @@ async function pollNews() {
       .setURL(link)
       .setFooter({ text: `Notícias • ${INSTANCE_ID}` });
 
-    const descBase =
-      (latest.contentSnippet || latest.summary || "").toString().trim().slice(0, 180);
+    const descBase = (latest.contentSnippet || latest.summary || "").toString().trim().slice(0, 180);
     if (descBase) emb.setDescription(descBase + (descBase.length >= 180 ? "..." : ""));
 
     if (img) emb.setImage(img);
@@ -311,7 +333,7 @@ async function pollNews() {
   }
 }
 
-// ====== ALERTAS AUTOMÁTICOS (pré-jogo / gol / fim) ======
+// ===== alertas automáticos (pré-jogo / gol / fim) =====
 async function pollAlerts() {
   try {
     if (!FOOTBALL_API_KEY || !CHANNEL_ID) return;
@@ -358,9 +380,7 @@ async function pollAlerts() {
 
           const emb = new EmbedBuilder()
             .setTitle("⏰ PRÉ-JOGO! (começa em ~10 min)")
-            .setDescription(
-              `⚽ **${homeName}** vs **${awayName}**\n🗓️ ${brDateTime(m.utcDate)} _(Brasília)_`
-            )
+            .setDescription(`⚽ **${homeName}** vs **${awayName}**\n🗓️ ${brDateTime(m.utcDate)} _(Brasília)_`)
             .setFooter({ text: `FutNews • ${INSTANCE_ID}` });
 
           const crest = crestUrl(homeTeam) || crestUrl(awayTeam);
@@ -454,8 +474,12 @@ async function handlePrefix(msg) {
   if (lower === "!teste") return msg.channel.send(`✅ FutNews ativo (${INSTANCE_ID})`);
 
   if (lower === "!noticias" || lower === "!notícia" || lower === "!news") {
-    const payload = await cmdNoticias(5);
-    return msg.channel.send(payload);
+    try {
+      const payload = await cmdNoticias(5);
+      return msg.channel.send(payload);
+    } catch (e) {
+      return msg.channel.send(`⚠️ Erro ao pegar notícias: ${e?.message || "erro"}`);
+    }
   }
 
   if (lower.startsWith("!tabela")) {
