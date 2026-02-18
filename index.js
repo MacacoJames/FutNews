@@ -1,13 +1,13 @@
 import { Client, GatewayIntentBits, EmbedBuilder } from "discord.js";
 import http from "http";
 import fetch from "node-fetch";
-import Parser from "rss-parser";
+import { XMLParser } from "fast-xml-parser";
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const FOOTBALL_API_KEY = process.env.FOOTBALL_API_KEY;
 const CHANNEL_ID = process.env.CHANNEL_ID;
 
-// RSS (notícias) — você pode trocar no Railway (Variables)
+// RSS (notícias) — pode trocar no Railway (Variables)
 const RSS_FEED_URL =
   process.env.RSS_FEED_URL || "https://ge.globo.com/rss/futebol/brasileirao-serie-a/";
 
@@ -22,14 +22,13 @@ const client = new Client({
 const INSTANCE_ID =
   process.env.INSTANCE_ID || `inst-${Math.random().toString(36).slice(2, 8)}`;
 
-// ===== RSS parser (com User-Agent) =====
-const parser = new Parser({
-  requestOptions: {
-    headers: {
-      "User-Agent": "Mozilla/5.0 (compatible; FutNewsBot/1.0)",
-      Accept: "application/rss+xml,application/xml,text/xml;q=0.9,*/*;q=0.8",
-    },
-  },
+// ===== RSS parser tolerante (aceita atributos sem valor) =====
+const xmlParser = new XMLParser({
+  ignoreAttributes: false,
+  attributeNamePrefix: "",
+  allowBooleanAttributes: true,
+  parseTagValue: true,
+  trimValues: true,
 });
 
 // ===== util =====
@@ -50,7 +49,7 @@ function safeTeamName(team) {
   return team?.shortName || team?.name || "Time";
 }
 function crestUrl(team) {
-  return team?.crest || null; // escudo real vindo da API
+  return team?.crest || null;
 }
 async function footballGet(url) {
   const res = await fetch(url, { headers: { "X-Auth-Token": FOOTBALL_API_KEY } });
@@ -66,34 +65,47 @@ const seenMsgIds = new Set();
 const cmdCooldown = new Map();
 
 // ===== estado (alertas de jogo) =====
-const matchState = new Map(); // matchId -> { home, away, status }
-const pregameSent = new Set(); // matchId
-const finishedSent = new Set(); // matchId
+const matchState = new Map();
+const pregameSent = new Set();
+const finishedSent = new Set();
 
 // ===== estado (notícias RSS) =====
-let lastNewsId = null; // evita repetir (memória do processo)
+let lastNewsId = null;
 
 // ===== RSS helpers =====
+function stripHtml(html = "") {
+  return String(html)
+    .replace(/<!\[CDATA\[/g, "")
+    .replace(/\]\]>/g, "")
+    .replace(/<[^>]*>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function pickImageFromRssItem(item) {
-  const enclosureUrl = item?.enclosure?.url;
-  if (enclosureUrl) return enclosureUrl;
+  // enclosure
+  if (item?.enclosure?.url) return item.enclosure.url;
+  if (item?.enclosure?.["@_url"]) return item.enclosure["@_url"];
 
-  const mediaContent = item?.["media:content"]?.url || item?.["media:content"]?.[0]?.url;
-  if (mediaContent) return mediaContent;
+  // media:content / media:thumbnail (pode vir como objeto ou array)
+  const mc = item?.["media:content"];
+  if (Array.isArray(mc) && (mc[0]?.url || mc[0]?.["@_url"])) return mc[0].url || mc[0]["@_url"];
+  if (mc?.url || mc?.["@_url"]) return mc.url || mc["@_url"];
 
-  const mediaThumb = item?.["media:thumbnail"]?.url || item?.["media:thumbnail"]?.[0]?.url;
-  if (mediaThumb) return mediaThumb;
+  const mt = item?.["media:thumbnail"];
+  if (Array.isArray(mt) && (mt[0]?.url || mt[0]?.["@_url"])) return mt[0].url || mt[0]["@_url"];
+  if (mt?.url || mt?.["@_url"]) return mt.url || mt["@_url"];
 
-  const html =
-    item?.content || item?.["content:encoded"] || item?.summary || item?.contentSnippet || "";
+  // tenta pegar <img src="..."> da descrição/conteúdo
+  const html = item?.description || item?.["content:encoded"] || item?.content || "";
   const match = String(html).match(/<img[^>]+src=["']([^"']+)["']/i);
   if (match?.[1]) return match[1];
 
   return null;
 }
 
-// Baixa RSS com fetch (User-Agent) e faz parseString (evita bloqueio do parseURL)
-async function parseRss(url) {
+// Baixa o RSS como texto e faz parse com fast-xml-parser
+async function getRssItems(url) {
   const res = await fetch(url, {
     headers: {
       "User-Agent": "Mozilla/5.0 (compatible; FutNewsBot/1.0)",
@@ -101,11 +113,19 @@ async function parseRss(url) {
     },
   });
   if (!res.ok) throw new Error(`RSS HTTP ${res.status}`);
+
   const xml = await res.text();
-  return parser.parseString(xml);
+  const parsed = xmlParser.parse(xml);
+
+  // RSS 2.0 típico: rss.channel.item
+  const channel = parsed?.rss?.channel || parsed?.channel;
+  let items = channel?.item || [];
+
+  if (!Array.isArray(items)) items = items ? [items] : [];
+  return items;
 }
 
-// ===== comandos (tabela/rodada/aovivo/time) =====
+// ===== comandos tabela/rodada/aovivo/time =====
 async function fetchStandings() {
   const data = await footballGet("https://api.football-data.org/v4/competitions/BSA/standings");
   const total = data.standings?.find((s) => s.type === "TOTAL");
@@ -241,7 +261,7 @@ function helpEmbed() {
         "• `!rodada`",
         "• `!aovivo`",
         "• `!time flamengo`",
-        "• `!noticias` (últimas 5)",
+        "• `!noticias` (últimas 5 com imagem)",
         "• `!teste`",
         "• `!ajuda`",
         "",
@@ -254,30 +274,30 @@ function helpEmbed() {
   return { embeds: [emb] };
 }
 
-// ===== notícias: comando !noticias =====
+// ===== comando: !noticias =====
 async function cmdNoticias(limit = 5) {
-  const feed = await parseRss(RSS_FEED_URL);
-  const items = (feed?.items ?? []).slice(0, Math.max(1, Math.min(10, limit)));
+  const items = await getRssItems(RSS_FEED_URL);
+  const slice = items.slice(0, Math.max(1, Math.min(10, limit)));
+  if (!slice.length) return { content: "📰 Não achei notícias agora." };
 
-  if (!items.length) return { content: "📰 Não achei notícias agora." };
-
-  const first = items[0];
+  const first = slice[0];
   const title = first.title || "Notícia";
   const link = first.link || "";
   const img = pickImageFromRssItem(first);
 
   const emb = new EmbedBuilder()
-    .setTitle(`📰 ${title}`)
+    .setTitle(`📰 ${stripHtml(title)}`)
     .setURL(link)
     .setFooter({ text: `Notícias • ${INSTANCE_ID}` });
 
-  const descBase = (first.contentSnippet || first.summary || "").toString().trim().slice(0, 180);
-  if (descBase) emb.setDescription(descBase + (descBase.length >= 180 ? "..." : ""));
+  const descRaw = first.description || first.summary || first["content:encoded"] || "";
+  const desc = stripHtml(descRaw).slice(0, 180);
+  if (desc) emb.setDescription(desc + (desc.length >= 180 ? "..." : ""));
 
   if (img) emb.setImage(img);
 
-  const rest = items.slice(1).map((it, i) => {
-    const t = it.title || `Notícia ${i + 2}`;
+  const rest = slice.slice(1).map((it, i) => {
+    const t = stripHtml(it.title || `Notícia ${i + 2}`);
     const l = it.link || "";
     return `${i + 2}. ${t}${l ? ` — ${l}` : ""}`;
   });
@@ -293,15 +313,13 @@ async function pollNews() {
   try {
     if (!RSS_FEED_URL || !CHANNEL_ID) return;
 
-    const feed = await parseRss(RSS_FEED_URL);
-    const items = feed?.items ?? [];
+    const items = await getRssItems(RSS_FEED_URL);
     if (!items.length) return;
 
     const latest = items[0];
-    const newsId = latest.guid || latest.id || latest.link;
+    const newsId = latest.guid || latest.id || latest.link || latest.title;
     if (!newsId) return;
 
-    // primeira execução: não spamma notícia velha
     if (lastNewsId === null) {
       lastNewsId = newsId;
       console.log("RSS pronto (sem postar a primeira notícia).");
@@ -313,7 +331,7 @@ async function pollNews() {
 
     const channel = await getChannel();
 
-    const title = latest.title || "Nova notícia";
+    const title = stripHtml(latest.title || "Nova notícia");
     const link = latest.link || "";
     const img = pickImageFromRssItem(latest);
 
@@ -322,8 +340,9 @@ async function pollNews() {
       .setURL(link)
       .setFooter({ text: `Notícias • ${INSTANCE_ID}` });
 
-    const descBase = (latest.contentSnippet || latest.summary || "").toString().trim().slice(0, 180);
-    if (descBase) emb.setDescription(descBase + (descBase.length >= 180 ? "..." : ""));
+    const descRaw = latest.description || latest.summary || latest["content:encoded"] || "";
+    const desc = stripHtml(descRaw).slice(0, 180);
+    if (desc) emb.setDescription(desc + (desc.length >= 180 ? "..." : ""));
 
     if (img) emb.setImage(img);
 
@@ -404,7 +423,7 @@ async function pollAlerts() {
         await channel.send({ embeds: [emb] });
       }
 
-      // GOL (mudou placar)
+      // GOL
       if (status === "LIVE" && (hs !== prev.home || as !== prev.away)) {
         const homeScored = hs > prev.home;
         const awayScored = as > prev.away;
@@ -418,8 +437,6 @@ async function pollAlerts() {
         } else if (awayScored && !homeScored) {
           title = `⚽ GOOOOL DO **${awayName}**!`;
           thumb = crestUrl(awayTeam) || thumb;
-        } else {
-          title = "⚽ GOOOOL! (atualização rápida)";
         }
 
         const emb = new EmbedBuilder()
@@ -515,10 +532,7 @@ client.on("messageCreate", async (msg) => {
 client.once("ready", () => {
   console.log(`ONLINE: ${client.user.tag} | PID ${process.pid} | ${INSTANCE_ID}`);
 
-  // Alertas de jogos (pré/goal/fim)
   setInterval(pollAlerts, 30_000);
-
-  // Notícias RSS (com imagem)
   setInterval(pollNews, 120_000);
 });
 
